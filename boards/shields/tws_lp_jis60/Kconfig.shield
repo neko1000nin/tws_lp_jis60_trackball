@@ -3,3 +3,9 @@ config SHIELD_TWS_LP_JIS60_LEFT
 
 config SHIELD_TWS_LP_JIS60_RIGHT
     def_bool $(shields_list_contains,tws_lp_jis60_right)
+
+# トラックボール配線診断 (./build.sh probe 専用。通常は無効)
+config TWS_LP_JIS60_TB_PIN_PROBE
+    bool "Probe D8/D9/D10 wiring of the PMW3610 trackball sensor and log the result"
+    depends on SHIELD_TWS_LP_JIS60_RIGHT
+    select GPIO

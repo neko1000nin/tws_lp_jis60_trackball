@@ -15,3 +15,96 @@
         , <&xiao_d 7 (GPIO_ACTIVE_HIGH)>
         ;
 };
+
+/*
+ * ---- PMW3610 トラックボール (右手側 = セントラル) ------------------------------
+ * 既存のキーマトリクス (D0〜D7) には一切触れず、空いているピンだけを使う。
+ *
+ *   SDIO   = D8  (P1.13)  ※ MOSI/MISO を同一ピンに割り当てた 3 線式 SPI
+ *   SCLK   = D9  (P1.14)
+ *   nCS    = D10 (P1.15)
+ *   (D8〜D10 の割り当ては trackball_config.h の TB_PIN_* で変更できる)
+ *   MOTION = NFC1 (P0.09) ※ 下の nfct-pins-as-gpios で NFC ピンを GPIO 化している。TB_PIN_MOTION_NFC で NFC2 も選べる
+ *
+ * 感度や向きの調整は trackball_config.h で行う。
+ */
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <dt-bindings/zmk/input_transform.h>
+#include <input/processors.dtsi>
+#include "trackball_config.h"
+
+/* XIAO の D8/D9/D10 は nRF52840 の P1.13/P1.14/P1.15 (D 番号 + 5) */
+#define TB_P1_PIN(d) ((d) + 5)
+/* 裏面パッド NFC1/NFC2 は P0.09/P0.10 (NFC 番号 + 8) */
+#define TB_P0_NFC_PIN(n) ((n) + 8)
+
+/* 裏面パッド NFC1/NFC2 (P0.09/P0.10) を通常の GPIO として使う。
+ * 初回起動時に一度だけ UICR へ書き込まれる (CONFIG_NFCT_PINS_AS_GPIOS=y と同じ効果)。 */
+&uicr {
+    nfct-pins-as-gpios;
+};
+
+#ifdef TB_PIN_PROBE
+/* 配線診断ビルド (./build.sh probe): D8〜D10 を診断コードが GPIO として直接操作するので、
+ * SPI とセンサードライバは無効にする。 */
+&spi2 {
+    status = "disabled";
+};
+#else
+
+&pinctrl {
+    spi2_pmw_default: spi2_pmw_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, TB_P1_PIN(TB_PIN_SCLK))>,
+                    <NRF_PSEL(SPIM_MOSI, 1, TB_P1_PIN(TB_PIN_SDIO))>,
+                    <NRF_PSEL(SPIM_MISO, 1, TB_P1_PIN(TB_PIN_SDIO))>;
+        };
+    };
+
+    spi2_pmw_sleep: spi2_pmw_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, TB_P1_PIN(TB_PIN_SCLK))>,
+                    <NRF_PSEL(SPIM_MOSI, 1, TB_P1_PIN(TB_PIN_SDIO))>,
+                    <NRF_PSEL(SPIM_MISO, 1, TB_P1_PIN(TB_PIN_SDIO))>;
+            low-power-enable;
+        };
+    };
+};
+
+&spi2 {
+    status = "okay";
+    compatible = "nordic,nrf-spim";
+    pinctrl-0 = <&spi2_pmw_default>;
+    pinctrl-1 = <&spi2_pmw_sleep>;
+    pinctrl-names = "default", "sleep";
+    cs-gpios = <&xiao_d TB_PIN_NCS GPIO_ACTIVE_LOW>;
+
+    trackball: trackball@0 {
+        status = "okay";
+        compatible = "pixart,pmw3610";
+        reg = <0>;
+        spi-max-frequency = <TB_SPI_FREQ>;
+        irq-gpios = <&gpio0 TB_P0_NFC_PIN(TB_PIN_MOTION_NFC) (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>; /* MOTION */
+        cpi = <TB_CPI>;
+        evt-type = <INPUT_EV_REL>;
+        x-input-code = <INPUT_REL_X>;
+        y-input-code = <INPUT_REL_Y>;
+#if TB_FORCE_AWAKE
+        force-awake;
+#endif
+    };
+};
+
+/ {
+    trackball_listener {
+        compatible = "zmk,input-listener";
+        device = <&trackball>;
+        /* 向きの補正 (軸の入れ替え → 反転) と、移動量の MUL/DIV 倍だけを行う。
+         * クリックやスクロールは扱わない。向きはセンサー内部の設定ではなく ZMK 側で処理する
+         * (入れ替えと反転の順序が明確なため)。 */
+        input-processors = <&zip_xy_transform ((TB_SWAP_XY * INPUT_TRANSFORM_XY_SWAP) | (TB_INVERT_X * INPUT_TRANSFORM_X_INVERT) | (TB_INVERT_Y * INPUT_TRANSFORM_Y_INVERT))
+                            &zip_xy_scaler TB_SCALE_MUL TB_SCALE_DIV>;
+    };
+};
+
+#endif /* TB_PIN_PROBE */

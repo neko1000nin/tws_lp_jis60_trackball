@@ -31,3 +31,53 @@
 
 
 https://www.keyboard-layout-editor.com/#/gists/35fc311bae26cc121fb2835988d3a9b2
+
+## トラックボール (PMW3610) 対応
+
+右手側 (セントラル) に PMW3610 センサーを追加できます。センサーを接続していなくても、キーボードとしてはそのまま動作します。
+
+### 配線
+
+既存のキーマトリクス (D0〜D7) は変更しません。未使用だったピンだけを使います。
+
+| センサー基板 J1 | XIAO BLE (右手側) | nRF52840 | 備考 |
+|---|---|---|---|
+| VIN | 3V3 | - | 3.3V 入力 (基板上の LDO で 1.8V に降圧) |
+| GND | GND | - | |
+| SDIO | D8 | P1.13 | データ (MOSI/MISO 兼用の 3 線式 SPI) |
+| SCLK | D9 | P1.14 | SPI クロック |
+| nCS | D10 | P1.15 | チップセレクト |
+| MOTION | NFC1 (裏面パッド) | P0.09 | 割り込み。overlay の `nfct-pins-as-gpios` で GPIO 化 |
+
+D8〜D10 の割り当ては `trackball_config.h` の `TB_PIN_SDIO` / `TB_PIN_SCLK` / `TB_PIN_NCS` で変更できます。
+
+### 動作
+
+- ボールの動きをマウスカーソルの移動としてホストへ送ります。クリックやスクロールはファームウェアでは扱いません。キーマップは従来のままです。
+- ディープスリープからの復帰はキー入力で行います (ボールを回しても復帰しません)。
+
+### 感度・向きの調整
+
+[boards/shields/tws_lp_jis60/trackball_config.h](boards/shields/tws_lp_jis60/trackball_config.h) を編集して、右手側だけ再ビルドします。
+
+| 項目 | 定義 | 既定値 |
+|---|---|---|
+| カーソル速度 (センサー CPI, 200〜3200 / 200 刻み) | `TB_CPI` | 600 |
+| カーソル速度の微調整 (MUL/DIV 倍) | `TB_SCALE_MUL` / `TB_SCALE_DIV` | 1 / 1 |
+| 軸の入れ替え、画面上の左右反転、上下反転 (入れ替えが先) | `TB_SWAP_XY` / `TB_INVERT_X` / `TB_INVERT_Y` | 1 / 1 / 1 |
+| 応答性優先 (電池消費増) | `TB_FORCE_AWAKE` | 0 |
+
+## ローカルビルド
+
+Docker があればコマンド一発でビルドできます。成果物は `firmware/*.uf2` に出力されます。
+
+```sh
+./build.sh          # 右手・左手・settings_reset を全部ビルド
+./build.sh right    # 右手側だけ (感度調整の繰り返しはこれで十分)
+./build.sh debug    # 右手側のログ出力付きビルド (USB シリアルにセンサーの初期化状況が出る)
+./build.sh probe    # 配線診断版 (D8/D9/D10 の全組み合わせでセンサーの応答を調べてログに出す)
+./build.sh update   # config/west.yml を変更した後にモジュールを取り直す
+./build.sh clean    # ビルドキャッシュ (.build/) を削除
+```
+
+初回は ZMK / Zephyr の取得に数分かかります。GitHub Actions でのビルドも従来どおり使えます。

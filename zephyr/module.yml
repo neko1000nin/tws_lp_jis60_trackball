@@ -1,4 +1,5 @@
 name: zmk-keyboard-tws_lp_jis60
 build:
+  cmake: .
   settings:
     board_root: .

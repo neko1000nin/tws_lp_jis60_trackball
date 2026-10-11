@@ -1,0 +1,276 @@
+diff --git a/app/Kconfig b/app/Kconfig
+index 6b4e350..61caa4e 100644
+--- a/app/Kconfig
++++ b/app/Kconfig
+@@ -212,6 +212,29 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
+ config ZMK_BLE_CLEAR_BONDS_ON_START
+     bool "Configuration that clears all bond information from the keyboard on startup."
+ 
++config ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE
++    bool "Only allow the active profile's host to connect"
++    select BT_FILTER_ACCEPT_LIST
++    help
++      When the active profile is bonded, advertise with a connection filter so that
++      only that host can connect. Hosts bonded to other profiles are rejected by the
++      controller instead of being connected but ignored.
++
++config ZMK_BLE_ADV_FILTER_FALLBACK_TIMEOUT
++    int "Seconds to wait for the active profile's host before falling back to open advertising"
++    depends on ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE
++    default 15
++
++config ZMK_BLE_ADV_FILTER_BOOT_RESTART_SEC
++    int "Seconds after the first filtered advertising to restart it once (workaround)"
++    depends on ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE
++    default 3
++
++config ZMK_BLE_ADV_START_DELAY_SEC
++    int "Delay the first advertising after boot by this many seconds (diagnostics only)"
++    depends on ZMK_BLE
++    default 0
++
+ # HID GATT notifications sent this way are *not* picked up by Linux, and possibly others.
+ config BT_GATT_NOTIFY_MULTIPLE
+     default n
+diff --git a/app/src/ble.c b/app/src/ble.c
+index 2611eee..a807c70 100644
+--- a/app/src/ble.c
++++ b/app/src/ble.c
+@@ -167,8 +167,131 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
+     }                                                                                              \
+     advertising_status = ZMK_ADV_DIR;
+ 
++#if IS_ENABLED(CONFIG_ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE)
++
++/* Only the host bonded to the active profile is allowed to connect. Other bonded hosts are
++ * rejected by the controller (filter accept list), so they never see a connection at all. */
++#define ZMK_ADV_CONN_NAME_FILTERED                                                                 \
++    BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_ONE_TIME | BT_LE_ADV_OPT_USE_NAME |  \
++                        BT_LE_ADV_OPT_FORCE_NAME_IN_AD | BT_LE_ADV_OPT_FILTER_CONN,                \
++                    BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
++
++static bool adv_filtered;
++static bt_addr_le_t adv_filtered_peer;
++/* 安全装置: 制限つきで接続待ちを始めて一定時間だれも接続してこなければ、制限なしに切り替える。
++ * 選択中の相手が接続できたら解除する。 */
++/* 診断用カウンタ */
++static uint32_t stat_filtered_adv_starts, stat_fallbacks, stat_fal_errors, stat_nonactive_connects,
++    stat_active_connects;
++
++static bool adv_filter_fallback;
++int update_advertising(void);
++static bool is_conn_active_profile(const struct bt_conn *conn);
++static void adv_filter_watchdog_cb(struct k_work *work);
++static K_WORK_DELAYABLE_DEFINE(adv_filter_watchdog, adv_filter_watchdog_cb);
++static void restart_filtered_adv_cb(struct k_work *work);
++static K_WORK_DEFINE(restart_filtered_adv_work, restart_filtered_adv_cb);
++/* 起動直後に始めた最初の制限つきアドバタイズは接続要求を受け付けないことが実機で分かっているので、
++ * 起動から少し経ったら必ず 1 回始め直す (左手側の接続とは別に)。 */
++static void boot_restart_cb(struct k_work *work) { k_work_submit(&restart_filtered_adv_work); }
++static K_WORK_DELAYABLE_DEFINE(boot_restart_work, boot_restart_cb);
++static bool boot_restart_scheduled;
++
++static bool open_adv_needs_restart(void) {
++    bool want_filter = !zmk_ble_active_profile_is_open() && !adv_filter_fallback;
++    if (want_filter != adv_filtered) {
++        return true;
++    }
++    return want_filter && bt_addr_le_cmp(&adv_filtered_peer, zmk_ble_active_profile_addr()) != 0;
++}
++
++static int start_open_adv(void) {
++    int err;
++    if (zmk_ble_active_profile_is_open() || adv_filter_fallback) {
++        err = bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
++        LOG_INF("Advertising (open) for profile %d: %s", active_profile,
++                adv_filter_fallback ? "FALLBACK, filter disabled" : "pairing allowed");
++        adv_filtered = false;
++        return err;
++    }
++
++    bt_addr_le_t *peer = zmk_ble_active_profile_addr();
++    err = bt_le_filter_accept_list_clear();
++    if (err) {
++        LOG_ERR("Failed to clear filter accept list (err %d)", err);
++        stat_fal_errors++;
++        return err;
++    }
++    err = bt_le_filter_accept_list_add(peer);
++    if (err) {
++        LOG_ERR("Failed to add active profile to filter accept list (err %d)", err);
++        stat_fal_errors++;
++        return err;
++    }
++    err = bt_le_adv_start(ZMK_ADV_CONN_NAME_FILTERED, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
++    if (!err) {
++        char addr_str[BT_ADDR_LE_STR_LEN];
++        bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
++        LOG_INF("Advertising (filtered) for profile %d, only %s may connect", active_profile,
++                addr_str);
++        adv_filtered = true;
++        stat_filtered_adv_starts++;
++        bt_addr_le_copy(&adv_filtered_peer, peer);
++        if (!boot_restart_scheduled) {
++            boot_restart_scheduled = true;
++            k_work_schedule(&boot_restart_work,
++                            K_SECONDS(CONFIG_ZMK_BLE_ADV_FILTER_BOOT_RESTART_SEC));
++        }
++        k_work_reschedule(&adv_filter_watchdog,
++                          K_SECONDS(CONFIG_ZMK_BLE_ADV_FILTER_FALLBACK_TIMEOUT));
++    }
++    return err;
++}
++
++
++static void adv_filter_watchdog_cb(struct k_work *work) {
++    if (!adv_filtered || advertising_status != ZMK_ADV_CONN ||
++        zmk_ble_active_profile_is_connected()) {
++        return;
++    }
++    LOG_WRN("Filtered advertising: nobody connected within %d s, falling back to open advertising",
++            CONFIG_ZMK_BLE_ADV_FILTER_FALLBACK_TIMEOUT);
++    adv_filter_fallback = true;
++    stat_fallbacks++;
++    update_advertising();
++}
++
++/* 制限つきアドバタイズの再始動。
++ * 起動直後、分割の左手側を探すスキャン中に始めた制限つきアドバタイズは接続要求を受け付けない
++ * (実機で確認。スキャン停止後に始めたものは正常に動く)。左手側が接続してスキャンが止まった時点で
++ * いったん止めて始め直す。 */
++static void restart_filtered_adv_cb(struct k_work *work) {
++    if (!adv_filtered || advertising_status != ZMK_ADV_CONN ||
++        zmk_ble_active_profile_is_connected()) {
++        return;
++    }
++    LOG_INF("Restarting filtered advertising");
++    int err = bt_le_adv_stop();
++    if (err) {
++        LOG_WRN("Failed to stop advertising for restart (err %d)", err);
++    }
++    advertising_status = ZMK_ADV_NONE;
++    adv_filtered = false;
++    update_advertising();
++}
++
++#else
++
++static inline bool open_adv_needs_restart(void) { return false; }
++
++static inline int start_open_adv(void) {
++    return bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
++}
++
++#endif /* CONFIG_ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE */
++
+ #define CHECKED_OPEN_ADV()                                                                         \
+-    err = bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);         \
++    err = start_open_adv();                                                                        \
+     if (err) {                                                                                     \
+         LOG_ERR("Advertising failed to start (err %d)", err);                                      \
+         return err;                                                                                \
+@@ -215,6 +338,13 @@ int update_advertising(void) {
+     case ZMK_ADV_CONN + CURR_ADV(ZMK_ADV_NONE):
+         CHECKED_OPEN_ADV();
+         break;
++    case ZMK_ADV_CONN + CURR_ADV(ZMK_ADV_CONN):
++        /* Profile changed while advertising: re-advertise for the new active profile */
++        if (open_adv_needs_restart()) {
++            CHECKED_ADV_STOP();
++            CHECKED_OPEN_ADV();
++        }
++        break;
+     }
+ 
+     return 0;
+@@ -507,6 +637,11 @@ static void connected(struct bt_conn *conn, uint8_t err) {
+ 
+     if (info.role != BT_CONN_ROLE_PERIPHERAL) {
+         LOG_DBG("SKIPPING FOR ROLE %d", info.role);
++#if IS_ENABLED(CONFIG_ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE)
++        if (!err && info.role == BT_CONN_ROLE_CENTRAL) {
++            k_work_submit(&restart_filtered_adv_work);
++        }
++#endif
+         return;
+     }
+ 
+@@ -519,12 +654,30 @@ static void connected(struct bt_conn *conn, uint8_t err) {
+         return;
+     }
+ 
+-    LOG_DBG("Connected %s", addr);
++    LOG_INF("Connected %s (%s)", addr,
++            is_conn_active_profile(conn) ? "active profile" : "NOT active profile");
++#if IS_ENABLED(CONFIG_ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE)
++    if (is_conn_active_profile(conn)) {
++        stat_active_connects++;
++    } else {
++        stat_nonactive_connects++;
++    }
++    LOG_INF("  stats: filtered_starts=%u fallbacks=%u fal_errors=%u connects(active=%u non-active=%u) adv=%s",
++            stat_filtered_adv_starts, stat_fallbacks, stat_fal_errors, stat_active_connects,
++            stat_nonactive_connects, adv_filtered ? "filtered" : "open");
++#endif
+ 
+     update_advertising();
+ 
+     if (is_conn_active_profile(conn)) {
+         LOG_DBG("Active profile connected");
++#if IS_ENABLED(CONFIG_ZMK_BLE_ADV_FILTER_ACTIVE_PROFILE)
++        if (adv_filter_fallback) {
++            LOG_INF("Active profile connected via fallback (open) advertising");
++            adv_filter_fallback = false;
++        }
++        k_work_cancel_delayable(&adv_filter_watchdog);
++#endif
+         k_work_submit(&raise_profile_changed_event_work);
+     }
+ }
+@@ -535,7 +688,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
+ 
+     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+ 
+-    LOG_DBG("Disconnected from %s (reason 0x%02x)", addr, reason);
++    LOG_INF("Disconnected from %s (reason 0x%02x)", addr, reason);
+ 
+     bt_conn_get_info(conn, &info);
+ 
+@@ -560,7 +713,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
+     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+ 
+     if (!err) {
+-        LOG_DBG("Security changed: %s level %u", addr, level);
++        LOG_INF("Security changed: %s level %u", addr, level);
+     } else {
+         LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
+     }
+@@ -680,6 +833,15 @@ static struct bt_conn_auth_info_cb zmk_ble_auth_info_cb_display = {
+     .pairing_complete = auth_pairing_complete,
+ };
+ 
++#if CONFIG_ZMK_BLE_ADV_START_DELAY_SEC > 0
++/* 診断用: 起動直後の接続待ちを遅らせ、USB シリアルのログを開く時間を確保する */
++static void delayed_first_adv_cb(struct k_work *work) {
++    LOG_WRN("Startup delay over, starting advertising now");
++    update_advertising();
++}
++static K_WORK_DELAYABLE_DEFINE(delayed_first_adv, delayed_first_adv_cb);
++#endif
++
+ static void zmk_ble_ready(int err) {
+     LOG_DBG("ready? %d", err);
+     if (err) {
+@@ -687,7 +849,12 @@ static void zmk_ble_ready(int err) {
+         return;
+     }
+ 
++#if CONFIG_ZMK_BLE_ADV_START_DELAY_SEC > 0
++    LOG_WRN("Diagnostics: delaying first advertising by %d s", CONFIG_ZMK_BLE_ADV_START_DELAY_SEC);
++    k_work_schedule(&delayed_first_adv, K_SECONDS(CONFIG_ZMK_BLE_ADV_START_DELAY_SEC));
++#else
+     update_advertising();
++#endif
+ }
+ 
+ static int zmk_ble_complete_startup(void) {

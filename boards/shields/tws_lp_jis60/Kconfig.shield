@@ -9,3 +9,4 @@ config TWS_LP_JIS60_TB_PIN_PROBE
     bool "Probe D8/D9/D10 wiring of the PMW3610 trackball sensor and log the result"
     depends on SHIELD_TWS_LP_JIS60_RIGHT
     select GPIO
+

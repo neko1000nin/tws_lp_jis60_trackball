@@ -1,6 +1,12 @@
+// ZMK Studio で標準の Layer-Tap (&lt) を選べるようにする。
+// このビルドは studio-rpc-usb-uart スニペットを使っていないため、キーマップから参照されない
+// behavior はファームウェアに入らず、Studio の一覧にも出ない。behaviors.dtsi より前で定義すること。
+#define ZMK_BEHAVIORS_KEEP_LT
+
 #include <behaviors.dtsi>
 #include <dt-bindings/zmk/keys.h>
 #include <dt-bindings/zmk/bt.h>
+#include <dt-bindings/zmk/pointing.h>
 #include <behaviors/rgbled_widget.dtsi>
 
 // JIS keyboard layout conversion definitions
@@ -13,7 +19,118 @@
 #define JP_YEN      0x89          // ¥
 #define JP_UNDSCR   LS(0x87)      // _
 
+// レイヤー番号 (下の keymap のレイヤー順と一致させること)
+// 番号 = 重なりの優先順位 (大きいほど上)。Fn の Lower/Adjust とマウス操作が Custom より上に来るよう、
+// Custom を Lower と Mouse の間に置いている (Custom モード中も Fn とマウス操作はすべてそのまま使える)。
+#define LAYER_DEFAULT 0
+#define LAYER_LOWER   1
+#define LAYER_CUSTOM  2 /* Android / iPad 用。Fn 2 つ + X で入り、Fn 2 つ + Z で戻る */
+#define LAYER_MOUSE   3
+#define LAYER_ADJUST  4
+
+// ---- スクロールの速さ --------------------------------------------------------------
+// SCROLL_SPEED    : 押し続けたときの速さ (1 秒あたりのノッチ数)。ZMK の標準は 10。
+// SCROLL_FIRST_MS : 1 回押したときに必ず 1 ノッチだけ動かすための時間 (ms)。
+//                   SCROLL_SPEED を変えたら下の表の値に合わせること (長すぎると 2 ノッチ動き、短すぎると動かない)。
+//                     SCROLL_SPEED 10 → 130 / 15 → 100 / 20 → 80 / 25 → 60 / 30 → 60
+#define SCROLL_SPEED    20
+#define SCROLL_FIRST_MS 80
+
+// スクロール用マクロ。1 回押すと必ず 1 ノッチ動き、押し続けると連続スクロールになる。
+// 標準の &msc は ZMK v0.3 では Studio 用のパラメータ情報を持たず Studio から割り当てられないので、
+// 引数なしの behavior として包み、Studio の一覧から選べるようにしている。
+// (&msc は等速で 16ms ごとに移動量を積算する。最初の SCROLL_FIRST_MS でちょうど 1 ノッチになる)
+// (引数名は DTS のプロパティ名の一部と衝突しないよう _ 付きにしている)
+#define SCROLL_MACRO(_node, _label, _dir)                                     \
+    _node: _node {                                                            \
+        compatible = "zmk,behavior-macro";                                    \
+        #binding-cells = <0>;                                                 \
+        display-name = _label;                                                \
+        wait-ms = <0>;                                                        \
+        tap-ms = <SCROLL_FIRST_MS>;                                           \
+        bindings = <&macro_tap &msc _dir>,                                    \
+                   <&macro_press &msc _dir>,                                  \
+                   <&macro_pause_for_release>,                                \
+                   <&macro_release &msc _dir>;                                \
+    };
+
 / {
+    behaviors {
+        // マウス操作用の Layer-Tap。単独で押すと元のキー、押しながら他のキーでレイヤーになる。
+        // 標準の &lt (tap-preferred) は、素早く「押す → J」とすると元のキー + J と判定されやすい。
+        // のどかの Mod0 と同じ操作感にするため、他のキーが押された時点でレイヤーと確定する
+        // hold-preferred を使う。
+        mlt: mouse_layer_tap {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            display-name = "Mouse Layer-Tap";
+            flavor = "hold-preferred";
+            tapping-term-ms = <200>;
+            // 直前のキー入力から 150ms 以内なら即座に元のキーと確定する。
+            // 速いタイピングの流れで打った「:」や英数キーが取りこぼされるのを防ぐ。
+            require-prior-idle-ms = <150>;
+            // 200ms より長く単独で押して離した場合も元のキーを送る (のどかと同じ)。
+            retro-tap;
+            bindings = <&mo>, <&kp>;
+        };
+
+        // ---- Custom レイヤー用 (Ctrl を押しているかどうかで動きが変わるキー) ----------------
+        // Ctrl なし = 通常のキー、Ctrl あり = 右側のキー (Ctrl は送らない。Shift は素通し)。
+        // のどかが使えない Android / iPad で Emacs 風のカーソル移動をするためのもの。
+#define CTRL_MORPH(_node, _label, _plain, _ctrl)                              \
+        _node: _node {                                                        \
+            compatible = "zmk,behavior-mod-morph";                            \
+            #binding-cells = <0>;                                             \
+            display-name = _label;                                            \
+            bindings = <_plain>, <_ctrl>;                                     \
+            mods = <(MOD_LCTL|MOD_RCTL)>;                                     \
+        };
+        CTRL_MORPH(cm_semi, "Enter (Ctrl: ;)",     &kp ENTER, &kp SEMI)   // Ctrl+Shift+; は Shift+; = + (JIS)
+        CTRL_MORPH(cm_e,    "E (Ctrl: End)",       &kp E,     &kp END)
+        CTRL_MORPH(cm_p,    "P (Ctrl: Up)",        &kp P,     &kp UP)
+        CTRL_MORPH(cm_n,    "N (Ctrl: Down)",      &kp N,     &kp DOWN)
+        CTRL_MORPH(cm_f,    "F (Ctrl: Right)",     &kp F,     &kp RIGHT)
+        CTRL_MORPH(cm_b,    "B (Ctrl: Left)",      &kp B,     &kp LEFT)
+        CTRL_MORPH(cm_h,    "H (Ctrl: BSpace)",    &kp H,     &kp BSPC)
+        CTRL_MORPH(cm_d,    "D (Ctrl: Delete)",    &kp D,     &kp DEL)
+        CTRL_MORPH(cm_s,    "S (Ctrl: Ctrl+F)",    &kp S,     &kp LC(F))
+        // A は 2 段: Ctrl なし = A、Ctrl = Home、Ctrl+Shift = Ctrl+A (全選択)
+        cm_a_ctrl: cm_a_ctrl {
+            compatible = "zmk,behavior-mod-morph";
+            #binding-cells = <0>;
+            display-name = "Home (Shift: Ctrl+A)";
+            bindings = <&kp HOME>, <&kp LC(A)>;
+            mods = <(MOD_LSFT|MOD_RSFT)>;
+        };
+        CTRL_MORPH(cm_a,    "A (Ctrl: Home)",      &kp A,     &cm_a_ctrl)
+
+        // ---- Bluetooth 接続先の切り替え (選択 + 他の接続先を切断) ------------------------
+        // ZMK は登録済みの機器と同時につながったままになり、選択中以外にはキーを送らない。
+        // すると切り替え先でない端末 (スマホなど) が「キーボード接続中」と見なして画面キーボードを
+        // 出さなくなるので、切り替え時に他の 4 つを切断する。登録は消えないので再ペアリングは不要。
+#define BT_SWITCH(_node, _label, _sel, _a, _b, _c, _d)                        \
+        _node: _node {                                                        \
+            compatible = "zmk,behavior-macro";                                \
+            #binding-cells = <0>;                                             \
+            display-name = _label;                                            \
+            wait-ms = <0>;                                                    \
+            tap-ms = <0>;                                                     \
+            bindings = <&bt BT_SEL _sel>,                                     \
+                       <&bt BT_DISC _a>, <&bt BT_DISC _b>,                    \
+                       <&bt BT_DISC _c>, <&bt BT_DISC _d>;                    \
+        };
+        BT_SWITCH(bt_sw0, "BT 1 (disconnect others)", 0, 1, 2, 3, 4)
+        BT_SWITCH(bt_sw1, "BT 2 (disconnect others)", 1, 0, 2, 3, 4)
+        BT_SWITCH(bt_sw2, "BT 3 (disconnect others)", 2, 0, 1, 3, 4)
+        BT_SWITCH(bt_sw3, "BT 4 (disconnect others)", 3, 0, 1, 2, 4)
+        BT_SWITCH(bt_sw4, "BT 5 (disconnect others)", 4, 0, 1, 2, 3)
+
+        SCROLL_MACRO(scrl_up,    "Scroll Up",    MOVE_Y(SCROLL_SPEED))
+        SCROLL_MACRO(scrl_down,  "Scroll Down",  MOVE_Y(-SCROLL_SPEED))
+        SCROLL_MACRO(scrl_left,  "Scroll Left",  MOVE_X(-SCROLL_SPEED))
+        SCROLL_MACRO(scrl_right, "Scroll Right", MOVE_X(SCROLL_SPEED))
+    };
+
     keymap {
         compatible = "zmk,keymap";
 
@@ -22,15 +139,18 @@
 // -----------------------------------------------------------------------------------------
 // | ESC |   1   |  2  |  3  |  4  |  5  |  6  |     |  7  |  8  |  9  |  0  |  -  |  ^  |  \  |  BSPC |
 //       |  TAB  |  Q  |  W  |  E  |  R  |  T  |     |  Y  |  U  |  I  |  O  |  P  |  @  |  [  | ENTER |
-//       |  CTRL |  A  |  S  |  D  |  F  |  G  |     |  H  |  J  |  K  |  L  |  ;  |  :  |  ]  |
+//       |  CTRL |  A  |  S  |  D  |  F  |  G  |     |  H  |  J  |  K  |  L  |  ;  |  :  |  ]  |      ← 「:」は Mouse Layer-Tap (単独 = :, 押しながら = Mouse Layer)
 //       | SHIFT |  Z  |  X  |  C  |  V  |  B  |     |  N  |  M  |  ,  |  .  |  /  |  \  |  ↑  | SHIFT |
-//       |  CTRL | Fn  | GUI | ALT |EISU | SPC |     | SPC | KANA| GUI | ALT | Fn  |  ←  |  ↓  |   →   |
+//       |  Fn   |HAN/ZEN| GUI | ALT |EISU | SPC |     | SPC | KANA| GUI | ALT | Fn  |  ←  |  ↓  |   →   |
+//   最下段の 4 キーは作者の配置 (以前は ZMK Studio 上だけで設定していたもの) を既定値にしている:
+//     Fn = &mo Lower / HAN/ZEN = GRAVE (Windows + JIS で半角/全角) /
+//     EISU = INT5 (単独) + Mouse Layer (押しながら) / KANA = INT4
             bindings = <
 &kp ESC &kp N1    &kp N2 &kp N3   &kp N4   &kp N5    &kp N6       &kp N7    &kp N8    &kp N9    &kp N0   &kp MINUS &kp JP_CARET &kp JP_YEN      &kp BSPC
         &kp TAB   &kp Q  &kp W    &kp E    &kp R     &kp T        &kp Y     &kp U     &kp I     &kp O    &kp P     &kp JP_AT    &kp JP_LBRACKET &kp ENTER
-        &kp LCTRL &kp A  &kp S    &kp D    &kp F     &kp G        &kp H     &kp J     &kp K     &kp L    &kp SEMI  &kp JP_COLON &kp JP_RBRACKET
+        &kp LCTRL &kp A  &kp S    &kp D    &kp F     &kp G        &kp H     &kp J     &kp K     &kp L    &kp SEMI  &mlt LAYER_MOUSE JP_COLON &kp JP_RBRACKET
         &kp LSHFT &kp Z  &kp X    &kp C    &kp V     &kp B        &kp N     &kp M     &kp COMMA &kp DOT  &kp FSLH  &kp JP_UNDSCR &kp UP          &kp RSHFT
-        &kp LCTRL &mo 1  &kp LGUI &kp LALT &kp LANG2 &kp SPACE    &kp SPACE &kp LANG1 &kp RGUI  &kp RALT &mo 1     &kp LEFT     &kp DOWN        &kp RIGHT
+        &mo LAYER_LOWER &kp GRAVE &kp LGUI &kp LALT &mlt LAYER_MOUSE INT5 &kp SPACE    &kp SPACE &kp INT4 &kp RGUI  &kp RALT &mo LAYER_LOWER &kp LEFT     &kp DOWN        &kp RIGHT
             >;
         };
 
@@ -41,13 +161,55 @@
 //       |       |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
 //       |       |     |     |     |     |     |       |     |     |     |     |     |     |     |
 //       |       |     |     |     |     |     |       |     |     |     |     |     |     |     |
-//       |       | Fn  |     |     |     |     |       |     |     |     |     | Fn  |     |     |
+//       |  Fn   | Fn  |     |     |     |     |       |     |     |     |     | Fn  |     |     |
+//   左 Fn は左下 1 番目へ移したので、そこにも Adjust への切り替えを置く。
+//   これで左右の Fn をどちらから先に押しても Adjust Layer に入れる (2 番目は upstream のまま残している)。
             bindings = <
 &trans  &kp F1 &kp F2 &kp F3 &kp F4 &kp F5 &kp F6    &kp F7 &kp F8 &kp F9 &kp F10 &kp F11 &kp F12 &trans &kp DEL
         &trans &trans &trans &trans &trans &trans    &trans &trans &trans &trans  &trans  &trans  &trans &trans
         &trans &trans &trans &trans &trans &trans    &trans &trans &trans &trans  &trans  &trans  &trans
         &trans &trans &trans &trans &trans &trans    &trans &trans &trans &trans  &trans  &trans  &trans &trans
-        &trans &mo 2  &trans &trans &trans &trans    &trans &trans &trans &trans  &mo 2   &trans  &trans &trans
+        &mo LAYER_ADJUST &mo LAYER_ADJUST  &trans &trans &trans &trans    &trans &trans &trans &trans  &mo LAYER_ADJUST   &trans  &trans &trans
+            >;
+        };
+
+        // Android / iPad 用。Fn 2 つ + X で有効、Fn 2 つ + Z で Default に戻る (スリープ復帰後は Default)。
+        // Ctrl を押しながらで Emacs 風のカーソル移動。無変換 (英数) と : は &trans なのでマウス操作もそのまま使える。
+        // Mouse と Adjust はこのレイヤーより上なので、Custom モード中もそのまま使える。
+        // Lower は下にあるが、Lower のキー (F1〜F12, Delete, Adjust 切り替え) と位置が重ならないので影響しない。
+        custom_layer {
+            display-name = "Custom";
+// -----------------------------------------------------------------------------------------
+// |     |     |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
+//       |     |     |     |  E  |     |     |       |     |     |     |     |  P  |     |     |     |
+//       |     |  A  |  S  |  D  |  F  |     |       |  H  |     |     |     |ENTER|     |     |
+//       |     |     |     |     |     |  B  |       |  N  |     |     |     |     |     |     |     |
+//       |     |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
+            bindings = <
+&trans  &trans &trans &trans &trans &trans &trans    &trans &trans &trans &trans &trans  &trans &trans &trans
+        &trans &trans &trans &cm_e  &trans &trans    &trans &trans &trans &trans &cm_p   &trans &trans &trans
+        &trans &cm_a  &cm_s  &cm_d  &cm_f  &trans    &cm_h  &trans &trans &trans &cm_semi &trans &trans
+        &trans &trans &trans &trans &trans &cm_b     &cm_n  &trans &trans &trans &trans  &trans &trans &trans
+        &trans &trans &trans &trans &trans &trans    &trans &trans &trans &trans &trans  &trans &trans &trans
+            >;
+        };
+
+        // マウス操作用レイヤー。Mouse Layer-Tap (&mlt) を割り当てたキーを押している間だけ有効。
+        // 指定のないキーは &trans なので、下のレイヤーの通常動作になる。
+        mouse_layer {
+            display-name = "Mouse";
+// -----------------------------------------------------------------------------------------
+// |     |     |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
+//       |     |     |     |     |     |     |       |     | SC← | SC↑ | SC→ |     |     |     |     |
+//       |     |     |     |     |     |     |       |     | LCLK| SC↓ | RCLK|     |     |     |
+//       |     |     |     |     |     |     |       |     | MB4 | MCLK| MB5 |     |     |     |     |
+//       |     |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
+            bindings = <
+&trans  &trans &trans &trans &trans &trans &trans    &trans &trans      &trans     &trans       &trans &trans &trans &trans
+        &trans &trans &trans &trans &trans &trans    &trans &scrl_left  &scrl_up   &scrl_right  &trans &trans &trans &trans
+        &trans &trans &trans &trans &trans &trans    &trans &mkp LCLK   &scrl_down &mkp RCLK    &trans &trans &trans
+        &trans &trans &trans &trans &trans &trans    &trans &mkp MB4    &mkp MCLK  &mkp MB5     &trans &trans &trans &trans
+        &trans &trans &trans &trans &trans &trans    &trans &trans      &trans     &trans       &trans &trans &trans &trans
             >;
         };
 
@@ -57,13 +219,14 @@
 // |     |     |     |     |     |     |     |       |     |     |     |     |     |     |     |     |
 //       |     | BT1 | BT2 | BT3 | BT4 | BT5 |       |     |     |     |     |     |     |     |     |
 //       |     | CLR |CLRAL|     |     |     |       |     |     |     |     |     |     |     |
-//       |     |     |     |     | CON | BAT |       | CON | BAT |     |     |     |     |     |
+//       |     | DEF |CUSTM|     | CON | BAT |       | CON | BAT |     |     |     |     |     |
+//   Z = Default モードへ戻る / X = Custom モード (Android / iPad 用) へ
 //       |     |     |     |     |     |     |       |     |     |     |     |     |     |     |
             bindings = <
 &trans  &trans &trans       &trans         &trans       &trans       &trans    &trans   &trans &trans &trans  &trans  &trans  &trans &trans
-        &trans &bt BT_SEL 0 &bt BT_SEL 1   &bt BT_SEL 2 &bt BT_SEL 3 &bt BT_SEL 4 &trans &trans &trans &trans  &trans  &trans  &trans &trans
+        &trans &bt_sw0      &bt_sw1        &bt_sw2      &bt_sw3      &bt_sw4      &trans &trans &trans &trans  &trans  &trans  &trans &trans
         &trans &bt BT_CLR   &bt BT_CLR_ALL &trans       &trans       &trans    &trans   &trans &trans &trans  &trans  &trans  &trans
-        &trans &trans       &trans         &trans       &ind_con     &ind_bat  &ind_con &ind_bat &trans &trans &trans &trans  &trans &trans
+        &trans &to LAYER_DEFAULT &to LAYER_CUSTOM &trans &ind_con &ind_bat  &ind_con &ind_bat &trans &trans &trans &trans  &trans &trans
         &trans &trans       &trans         &trans       &trans       &trans    &trans   &trans &trans &trans  &trans  &trans  &trans &trans
             >;
         };

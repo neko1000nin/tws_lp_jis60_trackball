@@ -100,7 +100,7 @@
         compatible = "zmk,input-listener";
         device = <&trackball>;
         /* 向きの補正 (軸の入れ替え → 反転) と、移動量の MUL/DIV 倍だけを行う。
-         * クリックやスクロールは扱わない。向きはセンサー内部の設定ではなく ZMK 側で処理する
+         * (クリックとスクロールはキーマップの Mouse レイヤーで行う)。向きはセンサー内部の設定ではなく ZMK 側で処理する
          * (入れ替えと反転の順序が明確なため)。 */
         input-processors = <&zip_xy_transform ((TB_SWAP_XY * INPUT_TRANSFORM_XY_SWAP) | (TB_INVERT_X * INPUT_TRANSFORM_X_INVERT) | (TB_INVERT_Y * INPUT_TRANSFORM_Y_INVERT))
                             &zip_xy_scaler TB_SCALE_MUL TB_SCALE_DIV>;
